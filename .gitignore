@@ -8,3 +8,5 @@ venv/
 build/
 dist/
 *.spec
+jarvis_memory.json
+jarvis_notes.txt

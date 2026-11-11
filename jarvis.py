@@ -14,18 +14,25 @@
 
 Список установленных голосов:
     python jarvis.py --voices
+
+Калибровка автозапуска музыки (один раз):
+    python jarvis.py --music-calibrate
 """
 
 import array
 import ctypes
+import ctypes.wintypes as wintypes
 import datetime
+import json
 import os
+import queue
 import random
 import re
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import webbrowser
 
 import ollama
@@ -50,6 +57,21 @@ WAKE_RE = re.compile(r"\b(джарвис|джарвіс|жарвис|jarvis)\b")
 
 USER_NAME = ""                # как к тебе обращаться (можно оставить пустым)
 SESSION_TIMEOUT = 120         # через сколько секунд тишины он «засыпает»
+
+# Память разговора
+HISTORY_MESSAGES = 60         # сколько последних реплик помнить (60 = 30 вопросов и ответов)
+CONTEXT_TOKENS = 8192         # «окно» модели: больше = помнит больше, но медленнее и тяжелее
+REMEMBER_BETWEEN_RUNS = True  # сохранять память разговора между запусками
+
+# Распознавание речи
+LISTEN_PAUSE = 1.2    # сколько секунд тишины считать концом фразы (больше = не режет на паузах)
+PHRASE_LIMIT = 30     # максимальная длина одной фразы, секунд
+
+# Музыка (Яндекс Музыка в браузере)
+MUSIC_SEARCH_URL = "https://music.yandex.ru/search?text="
+MUSIC_CLICK = None    # куда кликнуть, чтобы пошла музыка. Получить:
+                      # python jarvis.py --music-calibrate
+MUSIC_DELAY = 4.0     # сколько секунд ждать загрузку страницы перед кликом
 
 # Голос
 VOICE_RATE = 2        # скорость: от -10 (медленно) до 10 (быстро), 0 = обычная
@@ -92,8 +114,8 @@ SITES = {
     "почт": ("почту", "https://mail.google.com"),
     "гитхаб": ("GitHub", "https://github.com"),
     "википед": ("Википедию", "https://ru.wikipedia.org"),
-    "карты": ("карты", "https://www.google.com/maps"),
-    "переводчик": ("переводчик", "https://translate.google.com"),
+    "карты": ("карты", "https://yandex.ru/maps/"),
+    "переводчик": ("переводчик", "https://translate.yandex.ru/"),
 }
 
 APPS = {
@@ -110,6 +132,7 @@ BASE_DIR = os.path.dirname(
     sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
 )
 NOTES_FILE = os.path.join(BASE_DIR, "jarvis_notes.txt")
+MEMORY_FILE = os.path.join(BASE_DIR, "jarvis_memory.json")
 
 # ───────────────────────── Общее состояние ─────────────────────────
 
@@ -122,6 +145,7 @@ class State:
     session = False     # идёт ли диалог (слово «Джарвис» уже сказано)
     deadline = 0.0      # когда сессия истечёт
     pending = ""        # фраза, которой пользователь перебил Джарвиса
+    spoke_at = 0.0      # когда Джарвис закончил говорить
 
 
 S = State()
@@ -175,6 +199,15 @@ def fmt_duration(sec: int) -> str:
     if s:
         parts.append(f"{s} {plural(s, 'секунду', 'секунды', 'секунд')}")
     return " ".join(parts)
+
+def is_echo(heard: str, spoken: str) -> bool:
+    """Похоже ли услышанное на то, что только что сказал сам Джарвис (эхо из колонок)."""
+    words = [w for w in re.findall(r"\w+", heard.lower()) if len(w) >= 3]
+    if not words:
+        return False
+    own = {w[:4] for w in re.findall(r"\w+", spoken.lower()) if len(w) >= 3}
+    return sum(w[:4] in own for w in words) / len(words) >= 0.6
+
 
 # ───────────────────────── Аватар ─────────────────────────
 
@@ -334,8 +367,7 @@ class BargeWatcher(threading.Thread):
 
     def run(self):
         try:
-            with self.ears.mic as src:
-                self._loop(src)
+            self._loop(self.ears.src)
         except Exception as e:
             print(f"\n[ОШИБКА МИКРОФОНА ПРИ ПЕРЕБИВАНИИ] {type(e).__name__}: {e}")
 
@@ -390,9 +422,7 @@ def judge_barge(heard: str, spoken: str):
         return "ignore", ""
 
     # Это не эхо его собственного голоса из колонок?
-    own = {w[:4] for w in re.findall(r"\w+", spoken.lower()) if len(w) >= 3}
-    long_words = [w for w in words if len(w) >= 3]
-    if long_words and sum(w[:4] in own for w in long_words) / len(long_words) >= 0.6:
+    if is_echo(heard, spoken):
         return "ignore", ""
 
     wake = bool(WAKE_RE.search(heard))
@@ -409,9 +439,13 @@ def speak(text: str):
     S.reply = text
     S.mode = "speaking"
 
+    ears = EARS
+    if ears is not None:
+        ears.pause()                       # не слушаем себя через обычную запись
+
     watcher = None
-    if ALLOW_INTERRUPT and EARS is not None:
-        watcher = BargeWatcher(EARS)
+    if ALLOW_INTERRUPT and ears is not None:
+        watcher = BargeWatcher(ears)
         watcher.start()
 
     paused = False
@@ -459,8 +493,11 @@ def speak(text: str):
         if watcher is not None:
             watcher.stop.set()
             watcher.join(timeout=15)      # освобождаем микрофон
+        if ears is not None:
+            ears.resume()
         S.mode = "idle"
         S.last = text
+        S.spoke_at = time.time()
         if S.session:
             touch()
 
@@ -468,28 +505,89 @@ def speak(text: str):
 
 
 class Ears:
+    """Микрофон открыт постоянно. Одна нить записывает фразы, другая отправляет их
+    на распознавание. Поэтому слова не теряются, пока идёт распознавание, и
+    микрофон не закрывается и не открывается между фразами."""
+
     def __init__(self):
         self.r = sr.Recognizer()
-        self.r.pause_threshold = 0.8
+        self.r.pause_threshold = LISTEN_PAUSE
         self.r.operation_timeout = 8   # чтобы распознавание не зависало навсегда
         self.mic = sr.Microphone()
-        with self.mic as src:
-            self.r.adjust_for_ambient_noise(src, duration=1)
+        self.src = self.mic.__enter__()
+        self.r.adjust_for_ambient_noise(self.src, duration=1)
 
-    def listen(self, mode="idle", timeout=None, limit=8) -> str:
+        self.audio_q = queue.Queue()   # записанные фразы
+        self.text_q = queue.Queue()    # распознанный текст
+        self.paused = threading.Event()  # пока Джарвис говорит, запись стоит
+        self.busy = threading.Event()
+        self.alive = True
+        threading.Thread(target=self._capture, daemon=True).start()
+        threading.Thread(target=self._recognize, daemon=True).start()
+
+    def _capture(self):
+        while self.alive:
+            if self.paused.is_set():
+                time.sleep(0.02)
+                continue
+            audio = None
+            self.busy.set()
+            try:
+                audio = self.r.listen(self.src, timeout=0.3,
+                                      phrase_time_limit=PHRASE_LIMIT)
+            except sr.WaitTimeoutError:
+                pass
+            except Exception:
+                time.sleep(0.2)
+            finally:
+                self.busy.clear()
+            if audio is not None:
+                self.audio_q.put(audio)
+
+    def _recognize(self):
+        while self.alive:
+            audio = self.audio_q.get()
+            try:
+                # recognize_google отправляет аудио в интернет.
+                # Для офлайна позже можно заменить на Vosk или faster-whisper.
+                text = self.r.recognize_google(audio, language=LANGUAGE).lower().strip()
+            except sr.UnknownValueError:
+                continue
+            except sr.RequestError:
+                S.reply = "Нет связи с сервисом распознавания"
+                continue
+            except Exception:
+                continue
+            # эхо собственного голоса сразу после его речи
+            if text and time.time() - S.spoke_at < 3 and is_echo(text, S.last):
+                continue
+            if text:
+                self.text_q.put(text)
+
+    def listen(self, mode="idle", timeout=None) -> str:
+        """Ждёт распознанную фразу. Пустая строка, если за timeout ничего не было."""
         S.mode = mode
         try:
-            with self.mic as src:
-                audio = self.r.listen(src, timeout=timeout, phrase_time_limit=limit)
-            # recognize_google отправляет аудио в интернет.
-            # Для офлайна позже можно заменить на Vosk или faster-whisper.
-            text = self.r.recognize_google(audio, language=LANGUAGE)
-            return text.lower().strip()
-        except (sr.WaitTimeoutError, sr.UnknownValueError):
+            return self.text_q.get(timeout=timeout)
+        except queue.Empty:
             return ""
-        except sr.RequestError:
-            S.reply = "Нет связи с сервисом распознавания"
-            return ""
+
+    def pause(self):
+        """Останавливаем запись на время речи Джарвиса (чтобы не слышать себя)."""
+        self.paused.set()
+        t0 = time.time()
+        while self.busy.is_set() and time.time() - t0 < 2:
+            time.sleep(0.01)
+
+    def resume(self):
+        self.paused.clear()
+
+    def close(self):
+        self.alive = False
+        try:
+            self.mic.__exit__(None, None, None)
+        except Exception:
+            pass
 
 # ───────────────────────── Клавиши Windows ─────────────────────────
 
@@ -512,7 +610,7 @@ def confirm(ears: Ears, question: str) -> bool:
     if S.pending:                       # ответил, не дожидаясь конца вопроса
         answer, S.pending = S.pending, ""
     else:
-        answer = ears.listen(mode="listening", timeout=6, limit=4)
+        answer = ears.listen(mode="listening", timeout=6)
     S.heard = answer
     return any(w in answer for w in ("да", "подтверждаю", "давай", "уверен"))
 
@@ -639,6 +737,15 @@ def cmd_notes(cmd: str, ears: Ears):
     return None
 
 
+def cmd_forget(cmd: str, ears: Ears):
+    if re.search(r"забудь (всё|все|наш разговор|разговор|что мы говорили)|очисти (память|историю)|"
+                 r"сотри память|давай (начнём|начнем) (сначала|заново)|новый разговор", cmd):
+        history.clear()
+        save_history()
+        return pick("Всё, чистый лист.", "Забыл. Начинаем с нуля.")
+    return None
+
+
 # ── Информация ──
 
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -678,12 +785,59 @@ def cmd_help(cmd: str, ears: Ears):
 # ── Управление компьютером ──
 
 
+VOL_WORDS = {
+    "ноль": 0, "один": 1, "два": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6,
+    "семь": 7, "восемь": 8, "девять": 9, "десять": 10, "одиннадцать": 11,
+    "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14, "пятнадцать": 15,
+    "шестнадцать": 16, "семнадцать": 17, "восемнадцать": 18, "девятнадцать": 19,
+    "двадцать": 20, "тридцать": 30, "сорок": 40, "пятьдесят": 50, "шестьдесят": 60,
+    "семьдесят": 70, "восемьдесят": 80, "девяносто": 90, "сто": 100,
+}
+
+
+def parse_percent(cmd: str):
+    """Достаёт число 0-100 из «громкость 50», «на семьдесят пять процентов», «на максимум»."""
+    if re.search(r"максимальн|на максимум|на полную", cmd):
+        return 100
+    if re.search(r"минимальн|на минимум", cmd):
+        return 0
+    if re.search(r"наполовину|на половину", cmd):
+        return 50
+    m = re.search(r"\d{1,3}", cmd)
+    if m:
+        return min(100, int(m.group()))
+    total, found = 0, False
+    for w in re.findall(r"[а-яё]+", cmd):
+        if w in VOL_WORDS:
+            total += VOL_WORDS[w]
+            found = True
+    return min(100, total) if found else None
+
+
+def set_volume(percent: int):
+    """Точная громкость через медиа-клавиши: один шаг Windows = 2%.
+    Сначала опускаем до нуля, потом поднимаем до нужного уровня."""
+    percent = max(0, min(100, percent))
+    for _ in range(50):
+        combo(VK_VOL_DOWN)
+        time.sleep(0.004)
+    for _ in range(round(percent / 2)):
+        combo(VK_VOL_UP)
+        time.sleep(0.004)
+
+
 def cmd_volume(cmd: str, ears: Ears):
-    if "громче" in cmd:
+    if re.search(r"громкост|уровень звука|звук на", cmd):
+        p = parse_percent(cmd)
+        if p is not None:
+            set_volume(p)
+            return pick(f"Громкость {p} {plural(p, 'процент', 'процента', 'процентов')}.",
+                        f"Поставил на {p}.")
+    if "громче" in cmd or re.search(r"(увеличь|прибавь|повысь|добавь)\w*\s+(громкост|звук)", cmd):
         for _ in range(5):
             combo(VK_VOL_UP)
         return pick("Сделал погромче.", "Добавил громкости.")
-    if re.search(r"\b(по)?тише\b", cmd):
+    if re.search(r"\b(по)?тише\b|(уменьши|убавь|понизь)\w*\s+(громкост|звук)", cmd):
         for _ in range(5):
             combo(VK_VOL_DOWN)
         return pick("Сделал потише.", "Убавил.")
@@ -694,7 +848,8 @@ def cmd_volume(cmd: str, ears: Ears):
 
 
 def cmd_media(cmd: str, ears: Ears):
-    if re.search(r"пауз|останови музыку|продолжи (музыку|воспроизведение)|играй дальше", cmd):
+    if re.search(r"пауз|останови музыку|продолжи (музыку|воспроизведение)|играй дальше"
+                 r"|(включи|поставь) (мне )?(музыку|что-нибудь)\W*$", cmd):
         combo(VK_PLAY)
         return pick("Готово.", "Сделано.")
     if re.search(r"следующ\w+ (трек|песн\w+|композици\w+)|переключи трек", cmd):
@@ -752,6 +907,86 @@ def cmd_open(cmd: str, ears: Ears):
     return None
 
 
+# ── Музыка: «включи ...» ──
+
+MUSIC_VERBS = r"(?:включи|включай|поставь|запусти|сыграй|проиграй|врубай|воспроизведи)"
+MUSIC_NOUNS = r"(?:песню|песня|трек|композицию|музыку|альбом|плейлист|группу|исполнителя)"
+NOT_MUSIC = ("звук", "громкост", "таймер", "будильник", "свет", "компьютер", "экран",
+             "режим", "интернет", "вайфай", "блютуз", "подсветк", "напоминани", "игр")
+
+
+def _win_rect(hwnd):
+    rect = wintypes.RECT()
+    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    return rect
+
+
+def _click_play_later():
+    """Ждём, пока страница загрузится, и кликаем по кнопке play."""
+    time.sleep(MUSIC_DELAY)
+    try:
+        u = ctypes.windll.user32
+        u.GetForegroundWindow.restype = wintypes.HWND
+        u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        rect = _win_rect(u.GetForegroundWindow())
+        u.SetCursorPos(rect.left + MUSIC_CLICK[0], rect.top + MUSIC_CLICK[1])
+        time.sleep(0.15)
+        u.mouse_event(0x0002, 0, 0, 0, 0)   # левая кнопка вниз
+        u.mouse_event(0x0004, 0, 0, 0, 0)   # вверх
+    except Exception as e:
+        print(f"\n[ОШИБКА КЛИКА ПО МУЗЫКЕ] {type(e).__name__}: {e}")
+
+
+def calibrate_music():
+    """Запоминаем, где на странице Яндекс Музыки находится кнопка play."""
+    u = ctypes.windll.user32
+    u.WindowFromPoint.argtypes = [wintypes.POINT]
+    u.WindowFromPoint.restype = wintypes.HWND
+    u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    u.GetAncestor.restype = wintypes.HWND
+    u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+
+    print("Калибровка автозапуска музыки.\n")
+    print("1. Открой в браузере music.yandex.ru и найди через поиск любой трек.")
+    print("2. Окно браузера должно быть в том виде, в каком ты обычно им пользуешься")
+    print("   (лучше развёрнуто на весь экран).")
+    print("3. Наведи курсор на кнопку play у первого результата и НЕ КЛИКАЙ.")
+    print("   Курсор запомнится через 10 секунд.\n")
+    for i in range(10, 0, -1):
+        print(f"\r  осталось {i:2d} с  ", end="", flush=True)
+        time.sleep(1)
+    pt = wintypes.POINT()
+    u.GetCursorPos(ctypes.byref(pt))
+    root = u.GetAncestor(u.WindowFromPoint(pt), 2)    # 2 = GA_ROOT: само окно
+    rect = _win_rect(root)
+    print("\n\nГотово! Впиши в начале jarvis.py:\n")
+    print(f"MUSIC_CLICK = ({pt.x - rect.left}, {pt.y - rect.top})\n")
+
+
+def cmd_music(cmd: str, ears: Ears):
+    m = re.search(rf"\b{MUSIC_VERBS}\s+(?:мне\s+|нам\s+)?(?:{MUSIC_NOUNS}\s+)?(.+)", cmd)
+    if not m or any(w in cmd for w in NOT_MUSIC) or re.search(r"сыграй\w*\s+(в|со)\s", cmd):
+        return None
+    query = m.group(1)
+    query = re.sub(r"\s+(в|на)\s+(яндекс\w*\s*музык\w*|яндексе|браузере)\b", "", query)
+    query = re.sub(r"\s+от\s+", " ", query).strip(" ,.!?")
+    if not query or query in ("музыку", "песню", "трек"):
+        return None
+
+    # «включи ютуб» — это не музыка, а сайт
+    for key in list(SITES) + list(APPS):
+        if key in query:
+            return cmd_open("открой " + query, ears)
+
+    webbrowser.open(MUSIC_SEARCH_URL + urllib.parse.quote(query))
+    if MUSIC_CLICK:
+        threading.Thread(target=_click_play_later, daemon=True).start()
+        return pick(f"Включаю {query}.", f"Сейчас найду {query} в Яндекс Музыке.",
+                    f"Поставлю {query}.")
+    return (f"Открыл поиск по запросу {query}. Чтобы я сам нажимал play, "
+            "нужна одноразовая калибровка, она описана в README.")
+
+
 # ── Короткая болтовня без нейросети (чтобы отвечать мгновенно) ──
 
 
@@ -769,9 +1004,9 @@ def cmd_smalltalk(cmd: str, ears: Ears):
 
 # Порядок важен: сверху более конкретные команды
 HANDLERS = [
-    cmd_power, cmd_timer, cmd_notes, cmd_repeat, cmd_help,
+    cmd_power, cmd_timer, cmd_notes, cmd_forget, cmd_repeat, cmd_help,
     cmd_volume, cmd_media, cmd_time, cmd_date, cmd_system,
-    cmd_weather, cmd_search, cmd_open, cmd_smalltalk,
+    cmd_weather, cmd_search, cmd_open, cmd_music, cmd_smalltalk,
 ]
 
 
@@ -790,21 +1025,61 @@ history: list[dict] = []
 client = ollama.Client(host="http://127.0.0.1:11434", trust_env=False)
 
 
+def load_history():
+    if not REMEMBER_BETWEEN_RUNS or not os.path.exists(MEMORY_FILE):
+        return
+    try:
+        with open(MEMORY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        history.extend(
+            {"role": m["role"], "content": m["content"]} for m in data
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+            and isinstance(m.get("content"), str)
+        )
+        del history[:-HISTORY_MESSAGES]
+    except Exception as e:
+        print(f"\n[НЕ УДАЛОСЬ ЗАГРУЗИТЬ ПАМЯТЬ] {type(e).__name__}: {e}")
+
+
+def save_history():
+    if not REMEMBER_BETWEEN_RUNS:
+        return
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"\n[НЕ УДАЛОСЬ СОХРАНИТЬ ПАМЯТЬ] {type(e).__name__}: {e}")
+
+
+def notes_for_prompt() -> str:
+    """Последние заметки пользователя («запомни, что ...») тоже попадают в память модели."""
+    if not os.path.exists(NOTES_FILE):
+        return ""
+    try:
+        with open(NOTES_FILE, encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()][-15:]
+    except Exception:
+        return ""
+    items = [re.sub(r"^\[[^\]]*\]\s*", "", ln) for ln in lines]
+    return " Заметки, которые собеседник просил запомнить: " + "; ".join(items) + "." if items else ""
+
+
 def system_prompt() -> str:
     now = datetime.datetime.now()
     extra = f" Собеседника зовут {USER_NAME}." if USER_NAME else ""
-    return f"{PERSONA}{extra} Сейчас {now:%d.%m.%Y}, {now:%H:%M}."
+    return f"{PERSONA}{extra}{notes_for_prompt()} Сейчас {now:%d.%m.%Y}, {now:%H:%M}."
 
 
 def remember(user: str, assistant: str):
     """Записываем в память диалога и то, что сделали командами."""
     history.append({"role": "user", "content": user})
     history.append({"role": "assistant", "content": assistant})
-    del history[:-20]
+    del history[:-HISTORY_MESSAGES]
+    save_history()
 
 
 def _chat(messages):
-    opts = {"temperature": 0.8}
+    opts = {"temperature": 0.8, "num_ctx": CONTEXT_TOKENS}
     try:
         # think=False: без долгих «размышлений», ответ приходит быстрее
         return client.chat(model=MODEL, messages=messages, keep_alive="30m",
@@ -817,7 +1092,7 @@ def _chat(messages):
 
 def ask_llm(question: str) -> str:
     history.append({"role": "user", "content": question})
-    del history[:-20]   # помним последние 20 сообщений
+    del history[:-HISTORY_MESSAGES]
     try:
         resp = _chat([{"role": "system", "content": system_prompt()}] + history)
     except Exception as e:
@@ -826,17 +1101,63 @@ def ask_llm(question: str) -> str:
         return "Не могу достучаться до нейросети. Проверь, запущена ли Ollama."
     answer = re.sub(r"[*_`#]", "", resp["message"]["content"]).strip()
     history.append({"role": "assistant", "content": answer})
+    save_history()
     return answer
+
+
+def think(cmd: str, ears: Ears):
+    """Пока нейросеть отвечает, микрофон продолжает слушать:
+    если ты что-то договариваешь, вопрос склеивается и задаётся заново,
+    если говоришь «стоп», ответ отменяется (возвращаем None)."""
+    for attempt in range(3):
+        snapshot = list(history)
+        result = {}
+        worker = threading.Thread(
+            target=lambda q=cmd: result.update(reply=ask_llm(q)), daemon=True)
+        worker.start()
+
+        extra = []
+        while worker.is_alive():
+            if attempt < 2:
+                t = ears.listen(mode="thinking", timeout=0.5)
+                if t:
+                    extra.append(t)
+            else:
+                worker.join(0.5)
+        worker.join()
+
+        if not extra:
+            return result.get("reply")
+
+        history[:] = snapshot                  # откатываем память и спрашиваем заново
+        extra = [WAKE_RE.sub("", t).strip(" ,.!?") for t in extra]
+        words = re.findall(r"\w+", " ".join(extra))
+        if words and all(w in STOP_WORDS for w in words):
+            return None                         # «стоп»: ответ не нужен
+        cmd = (cmd + " " + " ".join(x for x in extra if x)).strip()
+        S.heard = cmd
+    return result.get("reply")
 
 # ───────────────────────── Главный цикл ─────────────────────────
 
-# «пока» и подобное считаем прощанием, только если это конец фразы
+# Фразы «иди отдыхать». Считаем их командой, только если они в конце фразы
 # (иначе «пока ты думаешь, расскажи...» закончило бы диалог)
-SLEEP_RE = re.compile(r"(^|\s)(пока|отбой|свободен|до связи|до свидания|спокойной ночи)\W*$")
+SLEEP_WORDS = (
+    r"пока|пока-пока|отбой|свободен|до связи|до свидания|до встречи|спокойной ночи|"
+    r"отдыхай|отдохни|можешь отдыхать|можешь отдохнуть|иди отдыхать|"
+    r"спи|поспи|засыпай|вздремни|иди спать|ложись спать|можешь спать|можешь поспать|"
+    r"на сегодня (?:всё|все)|всё на сегодня|на этом (?:всё|все)|хватит на сегодня|"
+    r"режим ожидания|в режим ожидания"
+)
+SLEEP_FILLER = r"(?:\s+(?:пожалуйста|немного|спокойно|теперь|уже|до завтра|до утра|на сегодня|пока|джарвис))*"
+SLEEP_RE = re.compile(rf"(^|\s)(?:{SLEEP_WORDS}){SLEEP_FILLER}\W*$")
+SLEEPY_RE = re.compile(r"отдых|отдохн|\bспи\b|поспи|засып|вздремн|спать|поспать|ночи|ожидани")
 QUIT_RE = re.compile(r"\b(выключись|завершить работу|закрой программу|выключи джарвис\w*)\b")
 
 LISTEN_LINES = ("Слушаю.", "Да?", "Я весь внимание.", "На связи.", "Что нужно?")
-BYE_LINES = ("Пока! Зови, если что.", "До встречи.", "Отдыхай, я рядом.", "Ладно, не буду мешать.")
+BYE_LINES = ("Пока! Зови, если что.", "До встречи.", "Ладно, не буду мешать.")
+SLEEP_LINES = ("Ухожу в режим ожидания. Зови, если что.", "Засыпаю. Позови, когда понадоблюсь.",
+               "Хорошо, отдыхаю. Я рядом.", "Принято. Тихо жду, пока позовёшь.")
 TIMEOUT_LINES = ("Что-то тихо стало. Если понадоблюсь, просто позови.",
                  "Ухожу в режим ожидания. Я рядом.",
                  "Пойду отдохну. Позови, если что.")
@@ -848,7 +1169,11 @@ def main():
     if "--voices" in sys.argv:
         print_voices()
         return
+    if "--music-calibrate" in sys.argv:
+        calibrate_music()
+        return
 
+    load_history()
     threading.Thread(target=avatar_loop, daemon=True).start()
     EARS = Ears()
     ears = EARS
@@ -871,7 +1196,7 @@ def main():
             text = cmd
         else:
             text = ears.listen(mode="listening" if S.session else "idle",
-                               timeout=2, limit=12)
+                               timeout=2)
             if not text:
                 continue
 
@@ -900,13 +1225,15 @@ def main():
 
         if SLEEP_RE.search(cmd):
             S.session = False
-            speak(pick(*BYE_LINES))
+            speak(pick(*(SLEEP_LINES if SLEEPY_RE.search(cmd) else BYE_LINES)))
             continue
 
         reply = handle_command(cmd, ears)
         if reply is None:
             S.mode = "thinking"
-            reply = ask_llm(cmd)
+            reply = think(cmd, ears)
+            if reply is None:               # сказал «стоп», пока он думал
+                continue
         else:
             remember(cmd, reply)
         speak(reply)
@@ -919,3 +1246,6 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
+    finally:
+        if EARS is not None:
+            EARS.close()
