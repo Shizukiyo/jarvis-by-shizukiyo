@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import webbrowser
 
 import ollama
@@ -66,6 +67,10 @@ REMEMBER_BETWEEN_RUNS = True  # сохранять память разговор
 # Распознавание речи
 LISTEN_PAUSE = 1.2    # сколько секунд тишины считать концом фразы (больше = не режет на паузах)
 PHRASE_LIMIT = 30     # максимальная длина одной фразы, секунд
+
+# Погода и поиск
+DEFAULT_CITY = "Москва"        # город по умолчанию для «какая погода». Поменяй на свой.
+SEARCH_URL = "https://yandex.ru/search/?text="   # чем искать в интернете («найди ...»)
 
 # Музыка (Яндекс Музыка в браузере)
 MUSIC_SEARCH_URL = "https://music.yandex.ru/search?text="
@@ -109,13 +114,15 @@ PERSONA = (
 
 # Сайты и программы: ключ = корень слова из голосовой команды
 SITES = {
+    "яндекс музык": ("Яндекс Музыку", "https://music.yandex.ru"),
+    "яндекс": ("Яндекс", "https://yandex.ru"),
     "ютуб": ("YouTube", "https://www.youtube.com"),
     "гугл": ("Гугл", "https://www.google.com"),
     "почт": ("почту", "https://mail.google.com"),
     "гитхаб": ("GitHub", "https://github.com"),
     "википед": ("Википедию", "https://ru.wikipedia.org"),
-    "карты": ("карты", "https://yandex.ru/maps/"),
-    "переводчик": ("переводчик", "https://translate.yandex.ru/"),
+    "карты": ("Яндекс Карты", "https://yandex.ru/maps"),
+    "переводчик": ("Яндекс Переводчик", "https://translate.yandex.ru"),
 }
 
 APPS = {
@@ -871,18 +878,122 @@ def cmd_system(cmd: str, ears: Ears):
     return None
 
 
-def cmd_weather(cmd: str, ears: Ears):
-    if "погод" in cmd:
-        webbrowser.open("https://www.google.com/search?q=погода")
-        return pick("Открываю прогноз погоды.", "Сейчас посмотрим, что там за окном.")
+WMO = {
+    0: "ясно", 1: "преимущественно ясно", 2: "переменная облачность", 3: "пасмурно",
+    45: "туман", 48: "изморозь и туман",
+    51: "лёгкая морось", 53: "морось", 55: "сильная морось",
+    56: "ледяная морось", 57: "сильная ледяная морось",
+    61: "небольшой дождь", 63: "дождь", 65: "сильный дождь",
+    66: "ледяной дождь", 67: "сильный ледяной дождь",
+    71: "небольшой снег", 73: "снег", 75: "сильный снегопад", 77: "снежная крупа",
+    80: "небольшой ливень", 81: "ливень", 82: "сильный ливень",
+    85: "снегопад", 86: "сильный снегопад",
+    95: "гроза", 96: "гроза с градом", 99: "сильная гроза с градом",
+}
+WEATHER_STOP = {
+    "погода", "погоду", "погоде", "погоды", "прогноз", "прогноза", "какая", "какой", "каком",
+    "сейчас", "сегодня", "завтра", "послезавтра", "на", "в", "во", "за", "окном", "улице",
+    "покажи", "открой", "скажи", "расскажи", "узнай", "мне", "будет", "там", "как", "что",
+    "температура", "температуру", "яндекс", "яндексе", "у", "нас", "по", "городу", "город", "дальше",
+}
+_geo_cache: dict = {}
+
+
+def http_json(url: str, timeout: int = 8):
+    req = urllib.request.Request(url, headers={"User-Agent": "jarvis-assistant"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def geocode(city: str):
+    """Ищем город. «Москве» или «Аахене» тоже находятся: пробуем и укороченные варианты."""
+    key = city.lower()
+    if key in _geo_cache:
+        return _geo_cache[key]
+    names = [city] + [city[:-k] for k in (1, 2) if len(city) - k >= 3]
+    for name in dict.fromkeys(names):
+        qs = urllib.parse.urlencode({"name": name, "count": 1, "language": "ru"})
+        data = http_json("https://geocoding-api.open-meteo.com/v1/search?" + qs)
+        if data.get("results"):
+            _geo_cache[key] = data["results"][0]
+            return _geo_cache[key]
     return None
+
+
+def signed(t: float) -> str:
+    t = round(t)
+    return "0" if t == 0 else (f"плюс {t}" if t > 0 else f"минус {abs(t)}")
+
+
+def deg(t: float) -> str:
+    return f"{signed(t)} {plural(abs(round(t)), 'градус', 'градуса', 'градусов')}"
+
+
+def weather_report(city: str, day: int, label: str) -> str:
+    """day: 0 = сейчас и сегодня, 1 = завтра, 2 = послезавтра."""
+    place = geocode(city)
+    if place is None:
+        return f"Не нашёл город {city}. Назови его ещё раз."
+    qs = urllib.parse.urlencode({
+        "latitude": place["latitude"], "longitude": place["longitude"],
+        "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+        "wind_speed_unit": "ms", "timezone": "auto", "forecast_days": 3,
+    })
+    data = http_json("https://api.open-meteo.com/v1/forecast?" + qs)
+    daily, cur = data["daily"], data["current"]
+    lo, hi = daily["temperature_2m_min"][day], daily["temperature_2m_max"][day]
+    desc = WMO.get(daily["weather_code"][day], "")
+    rain = (daily.get("precipitation_probability_max") or [None] * 3)[day]
+    rain_s = f", вероятность осадков {int(rain)} процентов" if rain and rain >= 30 else ""
+    rng = f"от {signed(lo)} до {signed(hi)} градусов"
+    place_name = label or place.get("name", city)
+
+    if day == 0:
+        t, feels = cur["temperature_2m"], cur["apparent_temperature"]
+        now_desc = WMO.get(cur["weather_code"], desc)
+        wind = round(cur["wind_speed_10m"])
+        feels_s = f" Ощущается как {deg(feels)}." if abs(round(feels) - round(t)) >= 2 else ""
+        return (f"{place_name} сейчас {deg(t)}, {now_desc}.{feels_s} "
+                f"Ветер {wind} {plural(wind, 'метр', 'метра', 'метров')} в секунду. "
+                f"Сегодня {rng}{rain_s}.")
+    when = "завтра" if day == 1 else "послезавтра"
+    return f"{place_name} {when}: {rng}, {desc}{rain_s}."
+
+
+def cmd_weather(cmd: str, ears: Ears):
+    if "погод" not in cmd and "прогноз" not in cmd:
+        return None
+
+    day = 2 if "послезавтра" in cmd else 1 if "завтра" in cmd else 0
+    city_words = [w for w in re.findall(r"[а-яёa-z\-]+", cmd) if w not in WEATHER_STOP]
+    city = " ".join(city_words) or DEFAULT_CITY
+
+    # «Покажи / открой погоду»: открываем Яндекс
+    if re.search(r"покажи|открой", cmd):
+        webbrowser.open(SEARCH_URL + urllib.parse.quote(f"погода {city}"))
+        return pick(f"Открываю погоду: {city}.", "Сейчас покажу, что там за окном.")
+
+    # Подпись: «В Москве» (как сказал пользователь) или название по умолчанию
+    label = ""
+    if city_words:
+        pm = re.search(rf"\b(во?)\s+{re.escape(city_words[0])}", cmd)
+        label = f"{pm.group(1).capitalize()} {' '.join(city_words).title()}" if pm else city.title()
+    else:
+        label = city
+    try:
+        return weather_report(city, day, label)
+    except Exception as e:
+        print(f"\n[ОШИБКА ПОГОДЫ] {type(e).__name__}: {e}")
+        webbrowser.open(SEARCH_URL + urllib.parse.quote(f"погода {city}"))
+        return "Не получилось узнать погоду напрямую, открыл Яндекс."
 
 
 def cmd_search(cmd: str, ears: Ears):
     m = re.search(r"(?:найди|поищи|загугли)\s+(.+)", cmd)
     if not m:
         return None
-    webbrowser.open(f"https://www.google.com/search?q={m.group(1)}")
+    webbrowser.open(SEARCH_URL + urllib.parse.quote(m.group(1)))
     return pick(f"Ищу: {m.group(1)}.", f"Сейчас посмотрим, что пишут про {m.group(1)}.")
 
 
@@ -902,7 +1013,7 @@ def cmd_open(cmd: str, ears: Ears):
                 subprocess.Popen(exe, shell=True)
             return pick(f"Запускаю {label}.", f"Готово, {label} открывается.")
     if "браузер" in cmd:
-        webbrowser.open("https://www.google.com")
+        webbrowser.open("https://yandex.ru")
         return "Открываю браузер."
     return None
 
